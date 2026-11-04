@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.data/
+.env*
+!.env.example
+test-results/
+playwright-report/
+*.log
+visual-proof/
+public/vision/runtime/
+public/vad/runtime/
+.tmp-test/

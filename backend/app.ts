@@ -1,0 +1,663 @@
+import express from "express";
+import helmet from "helmet";
+import {acceptClientTrace,sessionDiagnostics,traceServer} from "./diagnostics";
+import {diagnosticBatch,diagnosticOperation} from "../shared/diagnostics";
+import { randomUUID,timingSafeEqual } from "node:crypto";
+import { z } from "zod";
+import { Engine, type Session } from "./engine.ts";
+import { Problem } from "./provider.ts";
+import { agentInput, observeInput } from "../shared/agent.ts";
+import { TtsStream } from "./tts-stream.ts";
+import { getServerVoice } from "./tts-kokoro.ts";
+import { trackInput } from "../shared/object-motion.ts";
+import { voiceDiagnosticBatch } from "../shared/voice-diagnostics.ts";
+import { lookPreviewInput } from "../shared/look-preview.ts";
+import {conditionInput} from "../shared/camera-tools";
+import {LiveKitSessions,livekitConfig,livekitJoin} from "./livekit";
+
+export const cookieToken = (header = "") =>
+  header
+    .split(";")
+    .map((x) => x.trim())
+    .find((x) => x.startsWith("glint_session="))
+    ?.slice(14);
+const equal = (a: string, b: string) =>
+  Buffer.byteLength(a) === Buffer.byteLength(b) &&
+  timingSafeEqual(Buffer.from(a), Buffer.from(b));
+const observation = z.object({
+  mode: z.enum(["replay", "live"]),
+  question: z
+    .string()
+    .trim()
+    .max(1000)
+    .default(
+      "Check the visible parts against the confirmed instructions. Ask for a better view if uncertain.",
+    ),
+  model: z.string().max(150).default(""),
+  revision: z.number().int().positive(),
+  epoch: z.number().int().nonnegative(),
+  capturedAt: z.number(),
+  image: z.string().max(850000).optional(),
+  requestId: z.string().uuid(),
+});
+function validateCameraImage(image: string, maxBytes = 600000) {
+  if (!/^data:image\/jpeg;base64,[A-Za-z0-9+/]+=*$/.test(image))
+    throw new Problem(
+      400,
+      "IMAGE_INVALID",
+      "Use a captured camera JPEG, not a remote image URL.",
+    );
+  const bytes = Buffer.from(image.split(",")[1], "base64");
+  if (
+    bytes.length < 20 ||
+    bytes.length > maxBytes ||
+    bytes[0] !== 255 ||
+    bytes[1] !== 216 ||
+    bytes.at(-2) !== 255 ||
+    bytes.at(-1) !== 217
+  )
+    throw new Problem(
+      400,
+      "IMAGE_INVALID",
+      "The camera image is invalid or too large.",
+    );
+}
+/** Minimal browser-socket surface the voice handler needs; ws satisfies it. */
+export type VoiceSocket = {
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+  on(event: "message", listener: (data: unknown, isBinary?: boolean) => void): void;
+  on(event: "close", listener: () => void): void;
+};
+/**
+ * Transport ceiling above the 64 KB engine frame cap, so oversize frames
+ * get a proper error instead of a dropped socket.
+ */
+export const VOICE_WS_MAX_PAYLOAD = 262144;
+const voiceControl = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("open"),
+    requestId: z.string().uuid(),
+    epoch: z.number().int().nonnegative(),
+  }),
+  z.object({ type: z.literal("end") }),
+  z.object({ type: z.literal("close") }),
+]);
+function toVoiceBytes(data: unknown): Uint8Array | null {
+  if (data instanceof Uint8Array) return data;
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  if (Array.isArray(data) && data.every((x) => x instanceof Uint8Array))
+    return new Uint8Array(Buffer.concat(data));
+  return null;
+}
+/**
+ * One browser socket carrying voice turns: text control frames plus binary
+ * PCM16 mono, answered with partial/final/error JSON. The socket outlives
+ * a turn so the next open reuses it; closing the socket ends the stream.
+ */
+export function handleVoiceSocket(
+  client: VoiceSocket,
+  session: Session,
+  engine: Engine,
+) {
+  const send = (event: unknown) => {
+    try {
+      client.send(JSON.stringify(event));
+    } catch {
+      // The browser is gone; dropping the event is the whole job.
+    }
+  };
+  const fail = (error: unknown) => {
+    if (error instanceof Problem) {
+      // CANCELED is routine supersede churn (barge-in, epoch turnover).
+      if (error.code === "CANCELED")
+        console.debug("[glint-voice] request canceled");
+      else console.warn(`[glint-voice] request failed: ${error.code}`);
+      send({ type: "error", code: error.code, message: error.message });
+    } else if (error instanceof z.ZodError) {
+      console.warn("[glint-voice] request failed: INVALID_INPUT");
+      send({
+        type: "error",
+        code: "INVALID_INPUT",
+        message:
+          "Some fields are missing or invalid. Review the form and try again.",
+      });
+    } else {
+      console.warn("[glint-voice] request failed: UNAVAILABLE");
+      send({
+        type: "error",
+        code: "UNAVAILABLE",
+        message:
+          "The operation could not finish. Nothing was retried automatically.",
+      });
+    }
+  };
+  client.on("message", (data, isBinary) => {
+    try {
+      // Node ws supplies Buffers for text frames too. Use its opcode flag
+      // before deciding whether this is JSON control or microphone PCM.
+      if (isBinary === false && typeof data !== "string") {
+        const bytes = toVoiceBytes(data);
+        if (bytes) data = Buffer.from(bytes).toString("utf8");
+      }
+      if (typeof data !== "string") {
+        const bytes = toVoiceBytes(data);
+        if (!bytes) {
+          fail(
+            new Problem(
+              400,
+              "AUDIO_INVALID",
+              "The voice frame is not valid audio.",
+            ),
+          );
+          return;
+        }
+        engine.voiceFrame(session, bytes);
+        return;
+      }
+      let raw: unknown;
+      try {
+        raw = JSON.parse(data);
+      } catch {
+        fail(
+          new Problem(
+            400,
+            "INVALID_INPUT",
+            "The voice control message is not valid.",
+          ),
+        );
+        return;
+      }
+      const control = voiceControl.parse(raw);
+      if (control.type === "open") {
+        engine.voiceOpen(session, control.epoch, control.requestId, {
+          partial: (text) => send({ type: "partial", text }),
+          turn: (turnId, transcript) => send({ type: "turn", turnId, transcript }),
+          final: (transcript) => send({ type: "final", transcript }),
+          error: (message) =>
+            send({ type: "error", code: "ASR_ERROR", message }),
+          gap: () => send({ type: "gap" }),
+          closed: (info) => send({ type: "closed", ...info }),
+        });
+        send({ type: "opened" });
+        console.info("[glint-voice] open ok");
+      } else if (control.type === "end") {
+        engine.voiceFrame(session, JSON.stringify({ type: "end" }));
+      } else {
+        engine.voiceClose(session);
+        send({ type: "closed", code: 1000, retryable: false });
+      }
+    } catch (error) {
+      fail(error);
+    }
+  });
+  client.on("close", () => {
+    console.info("[glint-voice] browser socket closed");
+    engine.voiceClose(session);
+  });
+}
+export function createApp(engine: Engine, origin: string, production = false, livekit = new LiveKitSessions()) {
+  const app = express();
+  app.disable("x-powered-by");
+  app.use((req, res, next) => {
+    let path: string;
+    try {
+      path = decodeURIComponent(req.path).replaceAll("\\", "/");
+    } catch {
+      res.sendStatus(400);
+      return;
+    }
+    if (
+      path
+        .split("/")
+        .some((part) =>
+          /^(?:\.data|\.git|server|backend|tests)$|^\.env(?:\.|$)|\.sqlite(?:-|$)/i.test(
+            part,
+          ),
+        )
+    ) {
+      res.status(403).type("text").send("Private application resource");
+      return;
+    }
+    next();
+  });
+  app.use(
+    helmet({
+      contentSecurityPolicy: production
+        ? {
+            directives: {
+              defaultSrc: ["'self'"],
+              scriptSrc: ["'self'", "'wasm-unsafe-eval'"],
+              styleSrc: ["'self'"],
+              imgSrc: ["'self'", "blob:", "data:"],
+              mediaSrc: ["'self'", "blob:"],
+              workerSrc: ["'self'"],
+              connectSrc: ["'self'",...(livekitConfig()?["https://*.livekit.cloud","wss://*.livekit.cloud"]:[])],
+              objectSrc: ["'none'"],
+              frameAncestors: ["'none'"],
+            },
+          }
+        : false,
+      crossOriginEmbedderPolicy: false,
+    }),
+  );
+  app.use("/api", (_req, res, next) => {
+    res.set({
+      "Cache-Control": "no-store",
+      "Permissions-Policy": "camera=(self), microphone=(self)",
+    });
+    next();
+  });
+  app.use("/api", (req, _res, next) => {
+    if (req.headers.origin && req.headers.origin !== origin)
+      return next(
+        new Problem(
+          403,
+          "ORIGIN",
+          "This request came from a different origin.",
+        ),
+      );
+    if (!["GET", "HEAD"].includes(req.method) && req.headers.origin !== origin)
+      return next(
+        new Problem(
+          403,
+          "ORIGIN",
+          "A matching application origin is required.",
+        ),
+      );
+    next();
+  });
+  app.use(express.json({ limit: "1mb", strict: true }));
+  app.use("/api",(req,res,next)=>{
+    const session=engine.existing(cookieToken(req.headers.cookie));
+    if(!session||req.path.startsWith("/diagnostics")||req.path==="/voice-diagnostics")return next();
+    const id=z.string().uuid().safeParse(req.body?.requestId);
+    const requestId=id.success?id.data:randomUUID(),operation=diagnosticOperation(req.path.slice(1)),start=Date.now();
+    res.setHeader("x-glint-request-id",requestId);
+    traceServer(session,{stage:"request-start",operation,requestId,calls:session.calls});
+    let finished=false;
+    const complete=(closed:boolean)=>{if(finished)return;finished=true;traceServer(session,{stage:closed?"request-error":"request-end",operation,requestId,status:res.statusCode,durationMs:Date.now()-start,calls:session.calls,...(closed?{reason:"canceled" as const}:{})});};
+    res.on("finish",()=>complete(false));res.on("close",()=>complete(!res.writableEnded));next();
+  });
+  app.get("/api/session", (req, res) => {
+    const { session, token } = engine.session(cookieToken(req.headers.cookie));
+    if (token)
+      res.cookie("glint_session", token, {
+        httpOnly: true,
+        sameSite: "strict",
+        secure: production,
+        path: "/",
+        maxAge: 7 * 86400000,
+      });
+    // Reload/resume starts a new observation epoch; never resurrect a previous camera run.
+    res.json(
+      session.phase === "active"
+        ? engine.phase(session, "paused")
+        : engine.view(session),
+    );
+  });
+  app.use("/api", (req, res, next) => {
+    const session = engine.existing(cookieToken(req.headers.cookie));
+    if (!session)
+      return next(
+        new Problem(
+          401,
+          "SESSION_REQUIRED",
+          "Reload to create a private local session.",
+        ),
+      );
+    const csrf = req.header("x-glint-csrf") ?? "";
+    if (req.method !== "GET" && !equal(csrf, session.csrf))
+      return next(
+        new Problem(
+          403,
+          "CSRF",
+          "Session authorization expired. Reload before continuing.",
+        ),
+      );
+    res.locals.session = session;
+    next();
+  });
+  const s = (res: express.Response) => res.locals.session as Session;
+  app.get("/api/livekit/config",(_req,res)=>res.json({enabled:livekit.available}));
+  app.post("/api/livekit/token",async(req,res)=>{
+    const input=livekitJoin.parse(req.body);
+    res.json(await livekit.join(s(res),input.accessCode));
+  });
+  app.delete("/api/livekit/session",async(_req,res)=>{await livekit.end(s(res));res.json({ended:true});});
+  const diagnosticRates = new WeakMap<Session, { started: number; count: number }>();
+  app.post("/api/voice-diagnostics", (req, res) => {
+    const batch = voiceDiagnosticBatch.parse(req.body);
+    const session = s(res), now = Date.now();
+    let rate = diagnosticRates.get(session);
+    if (!rate || now - rate.started >= 60000) {
+      rate = { started: now, count: 0 };
+      diagnosticRates.set(session, rate);
+    }
+    if (rate.count + batch.events.length > 360)
+      throw new Problem(429, "DIAGNOSTIC_LIMIT", "Diagnostic event limit reached.");
+    rate.count += batch.events.length;
+    for (const event of batch.events)
+      console.info(`[glint-client-voice] ${JSON.stringify(event)}`);
+    res.json({ accepted: batch.events.length });
+  });
+  const traceRates=new WeakMap<Session,{at:number;count:number}>();
+  app.get("/api/diagnostics",(_req,res)=>res.json(sessionDiagnostics(s(res))));
+  app.post("/api/diagnostics",(req,res)=>{
+    const batch=diagnosticBatch.parse(req.body),session=s(res),now=Date.now();
+    let rate=traceRates.get(session);if(!rate||now-rate.at>=60000){rate={at:now,count:0};traceRates.set(session,rate);}
+    if(rate.count+batch.events.length>1200)throw new Problem(429,"DIAGNOSTIC_LIMIT","Diagnostic event limit reached.");
+    rate.count+=batch.events.length;acceptClientTrace(session,batch.events);res.json({accepted:batch.events.length});
+  });
+  app.post("/api/session/reset",(_req,res)=>res.json(engine.resetCallSession(s(res))));
+  app.post("/api/track", async(req,res)=>{
+    const input=trackInput.parse(req.body),session=s(res);
+    res.on("close",()=>{
+      if(!res.writableEnded && session.epoch===input.epoch)engine.phase(session,"paused");
+    });
+    res.json(await engine.trackMotion(session,input));
+  });
+  app.post("/api/look-preview",async(req,res)=>{
+    const input=lookPreviewInput.parse(req.body),session=s(res);
+    validateCameraImage(input.photo);
+    res.on("close",()=>{
+      if(!res.writableEnded && session.seen.has(input.requestId) && session.epoch===input.epoch)engine.phase(session,"paused");
+    });
+    res.json(await engine.previewLook(session,input));
+  });
+  app.post("/api/condition-check",async(req,res)=>{
+    const input=conditionInput.parse(req.body),session=s(res);validateCameraImage(input.photo);
+    res.on("close",()=>{if(!res.writableEnded&&session.seen.has(input.requestId)&&session.epoch===input.epoch)engine.phase(session,"paused");});
+    res.json(await engine.checkCondition(session,input));
+  });
+  app.post("/api/observe", async (req, res) => {
+    const input = observeInput.parse(req.body);
+    input.frames.forEach((frame) => validateCameraImage(frame.image, 90000));
+    const session = s(res);
+    res.on("close", () => {
+      if (
+        !res.writableEnded &&
+        session.seen.has(input.requestId) &&
+        session.epoch === input.epoch
+      )
+        engine.phase(session, "paused");
+    });
+    res.json(await engine.observe(session, input));
+  });
+  app.post("/api/vision/stop", (_req, res) =>
+    res.json(engine.clearVision(s(res))),
+  );
+  for (const route of ["agent", "agent/stream"])
+    app.post(`/api/${route}`, async (req, res) => {
+      const input = agentInput.parse(req.body);
+      input.frames?.forEach((frame) => validateCameraImage(frame.image, 90000));
+      if (input.image) {
+        if (!/^data:image\/jpeg;base64,[A-Za-z0-9+/]+=*$/.test(input.image))
+          throw new Problem(
+            400,
+            "IMAGE_INVALID",
+            "Use a camera JPEG, not a remote image.",
+          );
+        const bytes = Buffer.from(input.image.split(",")[1], "base64");
+        if (
+          bytes.length < 20 ||
+          bytes.length > 600000 ||
+          bytes[0] !== 255 ||
+          bytes[1] !== 216 ||
+          bytes.at(-2) !== 255 ||
+          bytes.at(-1) !== 217
+        )
+          throw new Problem(
+            400,
+            "IMAGE_INVALID",
+            "The camera image is invalid.",
+          );
+      }
+      if (route === "agent") {
+        res.json(await engine.converse(s(res), input));
+        return;
+      }
+      res.set({
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-store, no-transform",
+        "X-Accel-Buffering": "no",
+      });
+      res.flushHeaders();
+      const session = s(res);
+      let finished = false;
+      const emit = (event: unknown) => {
+        if (!res.destroyed) {
+          res.write(`data: ${JSON.stringify(event)}\n\n`);
+          if (typeof event === "object" && event !== null &&
+              "type" in event && event.type === "audio" && "seq" in event)
+            console.info(`[glint-voice] audio queued to browser seq=${event.seq}`);
+        }
+      };
+      // The neural voice loads beside the LLM stream so cold starts never
+      // delay text; early deltas buffer until the voice announces itself.
+      let tts: TtsStream | null = null;
+      const currentTts=():TtsStream|null=>tts;
+      let buffered = "";
+      let receivedText = false;
+      res.on("close", () => {
+        if (!finished && tts)
+          console.info("[glint-voice] reply connection closed before voice finished");
+        tts?.cancel();
+        if (!finished && session.epoch === input.epoch){
+          if(input.cameraTools?.imageInProgress)engine.cancelConversationRequest(session,input.requestId);
+          else engine.phase(session,"paused");
+        }
+      });
+      try {
+        const voiceReady=input.voice==="neural"?getServerVoice().catch(()=>null):null;
+        let preparingVoice:Promise<void>|undefined;
+        const prepareVoice=()=>preparingVoice??=Promise.resolve(voiceReady).then(voice=>{
+          if(res.destroyed||finished)return;
+          if(voice){tts=new TtsStream(voice,event=>emit(event),{
+            onTiming:(ms,chars,timing)=>console.info(`[glint-timing] ${JSON.stringify({scope:"server",lane:"tts",ms,chars,...timing})}`),
+          });tts.announce();tts.push(buffered);buffered="";}
+          else emit({type:"voice",mode:"none"});
+        });
+        const replyPromise = engine.converse(session, input, (text) => {
+          if (text) receivedText = true;
+          emit({ type: "delta", text });
+          if (tts) tts.push(text);
+          else buffered += text;
+          if(voiceReady&&text)void prepareVoice();
+        });
+        const planned=input.cameraTools?await replyPromise:undefined;
+        if(planned?.action){
+          // Tool execution must not wait for synthesis or expose tool arguments.
+          emit({type:"voice",mode:"none"});emit({type:"done",reply:planned});finished=true;return;
+        }
+        if (voiceReady) {
+          await prepareVoice();
+        }
+        const reply = planned??await replyPromise;
+        // Research and JSON provider responses do not emit text deltas.
+        // Feed their final text to the same voice pipeline exactly once.
+        if (!receivedText) currentTts()?.push(reply.message);
+        emit({ type: "done", reply });
+        if (currentTts()) {
+          await currentTts()!.finish();
+          emit({ type: "voice-done" });
+        }
+      } catch (error) {
+        currentTts()?.cancel();
+        emit({
+          type: "error",
+          message:
+            error instanceof Problem
+              ? error.message
+              : "The response stream was interrupted. You can retry your message.",
+        });
+      } finally {
+        finished = true;
+        res.end();
+      }
+    });
+  app.post("/api/voice", async (req, res) => {
+    const v = z
+      .object({
+        audio: z
+          .string()
+          .max(970000)
+          .regex(/^[A-Za-z0-9+/]+=*$/),
+        epoch: z.number().int().nonnegative(),
+        requestId: z.string().uuid(),
+      })
+      .parse(req.body);
+    const audio = Buffer.from(v.audio, "base64");
+    // Only bounded mono 24 kHz PCM WAV produced by the microphone client.
+    if (
+      audio.length < 48 ||
+      audio.length > 720044 ||
+      audio.toString("ascii", 0, 4) !== "RIFF" ||
+      audio.toString("ascii", 8, 12) !== "WAVE" ||
+      audio.toString("ascii", 12, 16) !== "fmt " ||
+      audio.readUInt32LE(16) !== 16 ||
+      audio.readUInt16LE(20) !== 1 ||
+      audio.readUInt16LE(22) !== 1 ||
+      audio.readUInt32LE(24) !== 24000 ||
+      audio.readUInt16LE(34) !== 16 ||
+      audio.toString("ascii", 36, 40) !== "data" ||
+      audio.readUInt32LE(40) !== audio.length - 44
+    )
+      throw new Problem(
+        400,
+        "AUDIO_INVALID",
+        "Use a microphone sentence of up to 15 seconds.",
+      );
+    res.json(await engine.transcribe(s(res), audio, v.epoch, v.requestId));
+  });
+  app.post("/api/new", (_req, res) =>
+    res.json(engine.resetConversation(s(res))),
+  );
+  app.post("/api/task", (req, res) =>
+    res.json(engine.setTask(s(res), req.body)),
+  );
+  app.post("/api/demo", (_req, res) =>
+    res.json(engine.setTask(s(res), null, true)),
+  );
+  app.post("/api/confirm", (req, res) =>
+    res.json(
+      engine.confirm(
+        s(res),
+        z.object({ revision: z.number().int() }).parse(req.body).revision,
+      ),
+    ),
+  );
+  app.post("/api/step", (req, res) => {
+    const v = z
+      .object({ id: z.string(), done: z.boolean(), revision: z.number().int() })
+      .parse(req.body);
+    res.json(engine.report(s(res), v.id, v.done, v.revision));
+  });
+  app.post("/api/phase", (req, res) =>
+    res.json(
+      engine.phase(
+        s(res),
+        z
+          .object({ phase: z.enum(["ready", "active", "paused"]) })
+          .parse(req.body).phase,
+      ),
+    ),
+  );
+  const localVoiceRequests=new WeakMap<object,number>();
+  app.post("/api/speech",async(req,res)=>{
+    const input=z.object({text:z.string().trim().min(1).max(1000),epoch:z.number().int()}).strict().parse(req.body);
+    const session=s(res);
+    if(!engine.view(session).key.connected)throw new Problem(401,"KEY_REQUIRED","Connect your model key first.");
+    if(input.epoch!==session.epoch)throw new Problem(409,"STALE","This reply is no longer current.");
+    if(Date.now()-(localVoiceRequests.get(session)??0)<1500)throw new Problem(429,"VOICE_LIMIT","Wait before requesting another voice reply.");
+    localVoiceRequests.set(session,Date.now());
+    const voice=await getServerVoice();if(!voice)throw new Problem(503,"VOICE_UNAVAILABLE","Cloud voice is unavailable.");
+    const events:unknown[]=[];let finished=false;
+    const stream=new TtsStream(voice,event=>events.push(event));
+    res.on("close",()=>{if(!finished)stream.cancel();});
+    stream.push(input.text);await stream.finish();finished=true;
+    if(!res.destroyed)res.json({events});
+  });
+  app.post("/api/key", async (req, res) => {
+    const v = z.object({ key: z.string().max(512) }).parse(req.body);
+    res.json(await engine.connect(s(res), v.key));
+  });
+  app.delete("/api/key", (_req, res) => res.json(engine.disconnect(s(res))));
+  app.delete("/api/session", (_req, res) => res.json(engine.forget(s(res))));
+  for (const route of ["check", "chat"])
+    app.post(`/api/${route}`, async (req, res) => {
+      const input = observation.parse(req.body);
+      if (route === "check" && input.mode === "live") {
+        if (
+          !input.image ||
+          !/^data:image\/jpeg;base64,[A-Za-z0-9+/]+=*$/.test(input.image)
+        )
+          throw new Problem(
+            400,
+            "IMAGE_INVALID",
+            "Use a captured JPEG frame, not a remote image URL.",
+          );
+        const bytes = Buffer.from(input.image.split(",")[1], "base64");
+        if (
+          bytes.length > 600000 ||
+          bytes.length < 20 ||
+          bytes[0] !== 255 ||
+          bytes[1] !== 216 ||
+          bytes[bytes.length - 2] !== 255 ||
+          bytes[bytes.length - 1] !== 217
+        )
+          throw new Problem(
+            400,
+            "IMAGE_INVALID",
+            "The frame is invalid or exceeds 600 KB.",
+          );
+      }
+      res.json(await engine.respond(s(res), input, route === "check"));
+    });
+  app.use("/api", (_req, _res, next) =>
+    next(new Problem(404, "NOT_FOUND", "This operation does not exist.")),
+  );
+  app.use(
+    (
+      error: unknown,
+      _req: express.Request,
+      res: express.Response,
+      _next: express.NextFunction,
+    ) => {
+      const session=res.locals.session as Session|undefined;
+      if(session&&!_req.path.startsWith("/api/diagnostics")&&_req.path!=="/api/voice-diagnostics"){
+        const code=error instanceof Problem?error.code:"";
+        const reason=code==="APP_LIMIT"?"limit":code==="BUSY"?"busy":code==="CANCELED"?"canceled":error instanceof z.ZodError?"invalid":"http";
+        const id=z.string().uuid().safeParse(res.getHeader("x-glint-request-id"));
+        traceServer(session,{stage:"request-error",...(id.success?{requestId:id.data}:{}),operation:diagnosticOperation(_req.path.replace(/^\/api\//,"")),status:error instanceof Problem?error.status:error instanceof z.ZodError?400:502,reason,calls:session.calls});
+      }
+      if (error instanceof Problem)
+        return res
+          .status(error.status)
+          .json({ code: error.code, message: error.message });
+      if (error instanceof z.ZodError)
+        return res.status(400).json({
+          code: "INVALID_INPUT",
+          message:
+            "Some fields are missing or invalid. Review the form and try again.",
+        });
+      if (
+        typeof error === "object" &&
+        error &&
+        "type" in error &&
+        error.type === "entity.too.large"
+      )
+        return res.status(413).json({
+          code: "TOO_LARGE",
+          message: "The request exceeds the allowed size.",
+        });
+      // Do not log arbitrary errors: upstream errors may contain a key, transcript, or image.
+      return res.status(502).json({
+        code: "UNAVAILABLE",
+        message:
+          "The operation could not finish. Nothing was retried automatically.",
+      });
+    },
+  );
+  return app;
+}

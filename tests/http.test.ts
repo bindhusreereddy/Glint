@@ -1,0 +1,467 @@
+import * as voiceRuntime from "../backend/tts-kokoro";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createServer, type Server } from "node:http";
+import { randomUUID } from "node:crypto";
+import { once } from "node:events";
+import { createApp } from "../backend/app.ts";
+import { Engine } from "../backend/engine.ts";
+import { Store } from "../backend/store.ts";
+import type { Provider } from "../backend/provider.ts";
+import type { View } from "../shared/model.ts";
+import { AgentProvider } from "../backend/agent-provider.ts";
+const origin = "http://127.0.0.1:3100";
+let server: Server, engine: Engine;
+async function fixture(provider?: Provider, agent?: AgentProvider) {
+  engine = new Engine(
+    new Store(":memory:"),
+    provider ?? {
+      models: async () => ["muse-spark-test"],
+      infer: async () => {
+        throw Error("UNEXPECTED LIVE CALL");
+      },
+    },
+    Date.now,
+    agent,
+  );
+  server = createServer(createApp(engine, origin));
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const port = (server.address() as { port: number }).port;
+  const base = `http://127.0.0.1:${port}`;
+  const r = await fetch(base + "/api/session");
+  const cookie = r.headers.get("set-cookie")!.split(";")[0],
+    view = (await r.json()) as View;
+  const call = (
+    path: string,
+    body: unknown = {},
+    options: {
+      cookie?: string;
+      origin?: string;
+      csrf?: string;
+      method?: string;
+    } = {},
+  ) =>
+    fetch(base + "/api/" + path, {
+      method: options.method ?? "POST",
+      headers: {
+        Cookie: options.cookie ?? cookie,
+        Origin: options.origin ?? origin,
+        "x-glint-csrf": options.csrf ?? view.csrf,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+  return { call, cookie, view, base, headers: r.headers };
+}
+afterEach(async () => {
+  engine?.close();
+  if (server) {
+    server.closeAllConnections();
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+});
+describe("HTTP isolation and validation", () => {
+  it("authenticates content-free voice diagnostics without charging provider allowance", async () => {
+    const f = await fixture();
+    const batch = { events: [{ turn: 1, stage: "speech-start", elapsedMs: 0 }] };
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    try {
+      expect((await f.call("voice-diagnostics", batch, { cookie: "glint_session=missing" })).status).toBe(401);
+      expect((await f.call("voice-diagnostics", batch, { csrf: "wrong" })).status).toBe(403);
+      const accepted = await f.call("voice-diagnostics", batch);
+      expect(accepted.status).toBe(200);
+      expect(await accepted.json()).toEqual({ accepted: 1 });
+      expect(info).toHaveBeenCalledWith('[glint-client-voice] {"turn":1,"stage":"speech-start","elapsedMs":0}');
+      info.mockClear();
+      expect((await f.call("voice-diagnostics", { events: [{ ...batch.events[0], transcript: "private" }] })).status).toBe(400);
+      expect(info).not.toHaveBeenCalled();
+      const updated = await (await fetch(f.base + "/api/session", { headers: { Cookie: f.cookie } })).json();
+      expect(updated.calls).toBe(f.view.calls);
+    } finally { info.mockRestore(); }
+  });
+  it("bounds diagnostic batch size and rate per session", async () => {
+    const f = await fixture();
+    const event = { turn: 1, stage: "speech-start", elapsedMs: 0 };
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    try {
+      expect((await f.call("voice-diagnostics", { events: Array(31).fill(event) })).status).toBe(400);
+      for (let i = 0; i < 12; i++)
+        expect((await f.call("voice-diagnostics", { events: Array(30).fill(event) })).status).toBe(200);
+      expect((await f.call("voice-diagnostics", { events: [event] })).status).toBe(429);
+    } finally { info.mockRestore(); }
+  });
+  it("validates automatic camera sequences before dispatch and requires the private session", async () => {
+    const f = await fixture();
+    const now = Date.now();
+    const body = {
+      frames: [now - 1000, now].map((capturedAt) => ({
+        image: "https://private.invalid/image.jpg",
+        capturedAt,
+      })),
+      epoch: f.view.epoch,
+      requestId: randomUUID(),
+      model: "muse-spark-test",
+    };
+    expect((await f.call("observe", body, { csrf: "forged" })).status).toBe(
+      403,
+    );
+    expect((await f.call("observe", body)).status).toBe(400);
+    expect((await f.call("observe", { ...body, frames: [] })).status).toBe(400);
+  });
+  it("streams visible text before final completion through the authenticated route", async () => {
+    const encoder = new TextEncoder();
+    let output: ReadableStreamDefaultController<Uint8Array>;
+    const transport = new ReadableStream<Uint8Array>({
+      start(controller) {
+        output = controller;
+      },
+    });
+    const agent = new AgentProvider(
+      (async () =>
+        new Response(transport, {
+          headers: { "content-type": "text/event-stream" },
+        })) as typeof fetch,
+    );
+    const f = await fixture(undefined, agent);
+    const view = (await (
+      await f.call("key", { key: "TEST_ONLY_KEY" })
+    ).json()) as View;
+    const body = {
+      question: "Hello",
+      model: "muse-spark-test",
+      epoch: view.epoch,
+      requestId: randomUUID(),
+    };
+    expect(
+      (await f.call("agent/stream", body, { csrf: "forged" })).status,
+    ).toBe(403);
+    const response = await f.call("agent/stream", body);
+    expect(response.headers.get("content-type")).toContain("text/event-stream");
+    const reader = response.body!.getReader(),
+      decoder = new TextDecoder();
+    output!.enqueue(
+      encoder.encode(
+        `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "Hello. " })}\n\n`,
+      ),
+    );
+    expect(decoder.decode((await reader.read()).value)).toContain(
+      '"type":"delta"',
+    );
+    output!.enqueue(
+      encoder.encode(
+        `data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: [{ type: "message", content: [{ type: "output_text", text: "Hello. " }] }] } })}\n\n`,
+      ),
+    );
+    output!.close();
+    let rest = "";
+    while (true) {
+      const part = await reader.read();
+      if (part.done) break;
+      rest += decoder.decode(part.value);
+    }
+    expect(rest).toContain('"type":"done"');
+    expect(rest).not.toContain("TEST_ONLY_KEY");
+  });
+  it("synths neural voice audio beside the reply stream when requested", async () => {
+    process.env.GLINT_TTS_MOCK = "1";
+    try {
+      const encoder = new TextEncoder();
+      let output: ReadableStreamDefaultController<Uint8Array>;
+      const transport = new ReadableStream<Uint8Array>({
+        start(controller) {
+          output = controller;
+        },
+      });
+      const agent = new AgentProvider(
+        (async () =>
+          new Response(transport, {
+            headers: { "content-type": "text/event-stream" },
+          })) as typeof fetch,
+      );
+      const f = await fixture(undefined, agent);
+      const view = (await (
+        await f.call("key", { key: "TEST_ONLY_KEY" })
+      ).json()) as View;
+      const response = await f.call("agent/stream", {
+        question: "Hello",
+        model: "muse-spark-test",
+        epoch: view.epoch,
+        requestId: randomUUID(),
+        voice: "neural",
+      });
+      expect(response.headers.get("content-type")).toContain(
+        "text/event-stream",
+      );
+      const reader = response.body!.getReader(),
+        decoder = new TextDecoder();
+      output!.enqueue(
+        encoder.encode(
+          `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "I can see you. " })}\n\n`,
+        ),
+      );
+      output!.enqueue(
+        encoder.encode(
+          `data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: [{ type: "message", content: [{ type: "output_text", text: "I can see you. " }] }] } })}\n\n`,
+        ),
+      );
+      output!.close();
+      let sse = "";
+      while (true) {
+        const part = await reader.read();
+        if (part.done) break;
+        sse += decoder.decode(part.value);
+      }
+      expect(sse).toContain('"type":"voice","mode":"neural"');
+      expect(sse).toContain('"type":"audio"');
+      expect(sse).toContain('"seq":0');
+      expect(sse).toContain('"text":"I can see you."');
+      const pcm = JSON.parse(
+        sse
+          .split("\n\n")
+          .map((block) => block.replace(/^data: /, ""))
+          .find((line) => line.includes('"type":"audio"'))!,
+      ).pcm as string;
+      expect(Buffer.from(pcm, "base64").length).toBeGreaterThan(1000);
+      expect(sse).toContain('"type":"done"');
+      expect(sse).toContain('"type":"voice-done"');
+      expect(sse.indexOf('"type":"voice-done"')).toBeGreaterThan(
+        sse.indexOf('"type":"done"'),
+      );
+    } finally {
+      delete process.env.GLINT_TTS_MOCK;
+    }
+  });
+  it("synthesizes a complete JSON reply when the provider sends no text deltas", async () => {
+    process.env.GLINT_TTS_MOCK = "1";
+    try {
+      const agent = new AgentProvider((async () => Response.json({
+        status: "completed",
+        output: [{ type: "message", content: [{ type: "output_text", text: "Ready to help." }] }],
+      })) as typeof fetch);
+      const f = await fixture(undefined, agent);
+      const view = await (await f.call("key", { key: "TEST_ONLY_KEY" })).json() as View;
+      const response = await f.call("agent/stream", {
+        question: "Hello", model: "muse-spark-test", epoch: view.epoch,
+        requestId: randomUUID(), voice: "neural",
+      });
+      const events = (await response.text()).split("\n\n").filter(Boolean)
+        .map(block => JSON.parse(block.replace(/^data: /, "")));
+      expect(events.some(event => event.type === "delta")).toBe(false);
+      expect(events.filter(event => event.type === "audio")).toEqual([
+        expect.objectContaining({ seq: 0, text: "Ready to help.", pcm: expect.any(String) }),
+      ]);
+      expect(events.at(-1).type).toBe("voice-done");
+    } finally {
+      delete process.env.GLINT_TTS_MOCK;
+    }
+  });
+  it("emits no voice events when the neural voice is off", async () => {
+    process.env.GLINT_TTS_MOCK = "1";
+    try {
+      const encoder = new TextEncoder();
+      let output: ReadableStreamDefaultController<Uint8Array>;
+      const transport = new ReadableStream<Uint8Array>({
+        start(controller) {
+          output = controller;
+        },
+      });
+      const agent = new AgentProvider(
+        (async () =>
+          new Response(transport, {
+            headers: { "content-type": "text/event-stream" },
+          })) as typeof fetch,
+      );
+      const f = await fixture(undefined, agent);
+      const view = (await (
+        await f.call("key", { key: "TEST_ONLY_KEY" })
+      ).json()) as View;
+      const response = await f.call("agent/stream", {
+        question: "Hello",
+        model: "muse-spark-test",
+        epoch: view.epoch,
+        requestId: randomUUID(),
+      });
+      const reader = response.body!.getReader(),
+        decoder = new TextDecoder();
+      output!.enqueue(
+        encoder.encode(
+          `data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: [{ type: "message", content: [{ type: "output_text", text: "Hi. " }] }] } })}\n\n`,
+        ),
+      );
+      output!.close();
+      let sse = "";
+      while (true) {
+        const part = await reader.read();
+        if (part.done) break;
+        sse += decoder.decode(part.value);
+      }
+      expect(sse).not.toContain('"type":"voice"');
+      expect(sse).not.toContain('"type":"audio"');
+      expect(sse).not.toContain('"type":"voice-done"');
+      expect(sse).toContain('"type":"done"');
+    } finally {
+      delete process.env.GLINT_TTS_MOCK;
+    }
+  });
+  it("carries conversation history across turns in one session", async () => {
+    const seen: number[] = [];
+    const agent = new AgentProvider(((url: string, init: { body?: string }) => {
+      if (url.endsWith("/models"))
+        return Promise.resolve(
+          Response.json({ data: [{ id: "muse-spark-test" }] }),
+        );
+      const input = JSON.parse(String(init.body)).input as unknown[];
+      const history = input.length - 1;
+      seen.push(history);
+      const text = `history:${history}`;
+      return Promise.resolve(
+        new Response(
+          `data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\ndata: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: [{ type: "message", content: [{ type: "output_text", text }] }] } })}\n\n`,
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+      );
+    }) as typeof fetch);
+    const f = await fixture(undefined, agent);
+    const view = (await (
+      await f.call("key", { key: "TEST_ONLY_KEY" })
+    ).json()) as View;
+    const ask = async (question: string) => {
+      const response = await f.call("agent/stream", {
+        question,
+        model: "muse-spark-test",
+        epoch: view.epoch,
+        requestId: randomUUID(),
+      });
+      const reader = response.body!.getReader(),
+        decoder = new TextDecoder();
+      let sse = "";
+      while (true) {
+        const part = await reader.read();
+        if (part.done) break;
+        sse += decoder.decode(part.value);
+      }
+      return sse;
+    };
+    const first = await ask("My pet is a cat.");
+    const second = await ask("What is my pet?");
+    expect(first).toContain("history:0");
+    expect(second).toContain("history:2");
+    expect(seen).toEqual([0, 2]);
+  });
+  it("sets a private no-store, HttpOnly, SameSite session cookie; rejects missing session/origin/CSRF", async () => {
+    const f = await fixture();
+    expect(f.headers.get("cache-control")).toBe("no-store");
+    expect(f.headers.get("set-cookie")).toContain("HttpOnly");
+    expect(f.headers.get("set-cookie")).toContain("SameSite=Strict");
+    expect((await f.call("demo", {}, { cookie: "" })).status).toBe(401);
+    expect(
+      (await f.call("demo", {}, { origin: "https://foreign.example" })).status,
+    ).toBe(403);
+    expect((await f.call("demo", {}, { csrf: "forged" })).status).toBe(403);
+  });
+  it("does not return another session task or accept its CSRF token", async () => {
+    const f = await fixture();
+    const a = await f.call("demo");
+    expect(a.status).toBe(200);
+    const r = await fetch(f.base + "/api/session");
+    const other = (await r.json()) as View;
+    expect(other.task).toBeNull();
+    expect(
+      (
+        await f.call(
+          "demo",
+          {},
+          { cookie: r.headers.get("set-cookie")!.split(";")[0] },
+        )
+      ).status,
+    ).toBe(403);
+  });
+  it("validates source, blocks replay on a custom task, and rejects remote/oversized images", async () => {
+    const f = await fixture();
+    expect((await f.call("task", { title: "incomplete" })).status).toBe(400);
+    let v = (await (await f.call("demo")).json()) as View;
+    v = (await (
+      await f.call("confirm", { revision: v.task!.revision })
+    ).json()) as View;
+    v = (await (await f.call("phase", { phase: "active" })).json()) as View;
+    const body = {
+      mode: "live",
+      question: "Check",
+      model: "muse-spark-test",
+      revision: v.task!.revision,
+      epoch: v.epoch,
+      capturedAt: Date.now(),
+      requestId: randomUUID(),
+    };
+    expect(
+      (await f.call("check", { ...body, image: "https://localhost/private" }))
+        .status,
+    ).toBe(400);
+    expect(
+      (await f.call("check", { ...body, image: "x".repeat(1100000) })).status,
+    ).toBe(413);
+  });
+  it("requires preview consent, session authorization and a bounded local JPEG",async()=>{
+    let calls=0;
+    const f=await fixture({models:async()=>["muse-spark-test"],infer:async()=>{calls++;throw Error("Unexpected dispatch");}});
+    const body={photo:"https://example.com/photo.jpg",prompt:"witch costume",consent:true,epoch:f.view.epoch,requestId:randomUUID()};
+    expect((await f.call("look-preview",{...body,consent:false})).status).toBe(400);
+    expect((await f.call("look-preview",body)).status).toBe(400);
+    expect((await f.call("look-preview",body,{csrf:"wrong"})).status).toBe(403);
+    expect((await f.call("look-preview",{...body,photo:"x".repeat(1100000)})).status).toBe(413);
+    expect(calls).toBe(0);
+  });
+  it("sanitizes unhandled validation failures and never returns a key in session view", async () => {
+    const f = await fixture({
+      models: async () => {
+        throw Error("secret TEST_ONLY_KEY");
+      },
+      infer: async () => {
+        throw Error();
+      },
+    });
+    const r = await f.call("key", { key: "TEST_ONLY_KEY" });
+    expect(r.status).toBe(502);
+    expect(await r.text()).not.toContain("TEST_ONLY_KEY");
+    const current = await (
+      await fetch(f.base + "/api/session", { headers: { Cookie: f.cookie } })
+    ).text();
+    expect(current).not.toContain("TEST_ONLY_KEY");
+  });
+});
+
+it("requires session authorization and a matching origin to reset the allowance",async()=>{
+ const {call}=await fixture();
+ expect((await call("session/reset",{},{csrf:"wrong"})).status).toBe(403);
+ expect((await call("session/reset",{},{origin:"https://other.example"})).status).toBe(403);
+ const response=await call("session/reset");expect(response.status).toBe(200);
+ const view=await response.json();expect(view.calls).toBe(0);expect(view.key.connected).toBe(false);
+});
+
+it("exports only authorized session diagnostics with safe request correlation",async()=>{
+ const {call,cookie,base}=await fixture();
+ const phase=await call("phase",{phase:"paused"});
+ expect(phase.headers.get("x-glint-request-id")).toMatch(/^[a-f0-9-]{36}$/);
+ const uploaded=await call("diagnostics",{events:[{at:100,stage:"task",state:"busy"}]});expect(uploaded.status).toBe(200);
+ expect((await call("diagnostics",{events:[{at:100,stage:"task",text:"PRIVATE_TEXT"}]})).status).toBe(400);
+ expect((await call("diagnostics",{events:[]},{csrf:"wrong"})).status).toBe(403);
+ const exported=await(await fetch(base+"/api/diagnostics",{headers:{Cookie:cookie}})).json();
+ expect(exported.server.some((event:{operation:string})=>event.operation==="phase")).toBe(true);
+ expect(exported.client).toEqual([{at:100,stage:"task",state:"busy"}]);
+ expect(JSON.stringify(exported)).not.toContain("PRIVATE_TEXT");
+ expect(JSON.stringify(exported)).not.toContain(cookie.split("=")[1]);
+ const other=await fetch(base+"/api/session"),otherCookie=other.headers.get("set-cookie")!.split(";")[0];
+ const isolated=await(await fetch(base+"/api/diagnostics",{headers:{Cookie:otherCookie}})).json();expect(isolated.server).toEqual([]);expect(isolated.client).toEqual([]);
+});
+
+it("returns an image action without waiting for voice initialization or speaking tool arguments",async()=>{
+ let release!:(value:null)=>void;const waiting=new Promise<null>(resolve=>{release=resolve;});
+ const spy=vi.spyOn(voiceRuntime,"getServerVoice").mockReturnValue(waiting);
+ try{
+  const agent=new AgentProvider((async()=>Response.json({status:"completed",output:[{type:"function_call",status:"completed",call_id:"image-call",name:"edit_camera_image",arguments:JSON.stringify({prompt:"INTERNAL_IMAGE_PROMPT",source:"camera"})}]})) as typeof fetch);
+  const f=await fixture(undefined,agent),connected=await(await f.call("key",{key:"TEST_ONLY_KEY"})).json();
+  const response=await f.call("agent/stream",{question:"Create an image",model:"muse-spark-test",voice:"neural",epoch:connected.epoch,requestId:randomUUID(),cameraTools:{camera:true,tracking:false,lastImage:false}});
+  const text=await response.text();const events=text.split("\n\n").filter(block=>block.startsWith("data: ")).map(block=>JSON.parse(block.slice(6)));
+  const done=events.find(event=>event.type==="done");expect(done.reply.message).toBe("I’m creating your image.");expect(done.reply.message).not.toContain("INTERNAL_IMAGE_PROMPT");expect(events.some(event=>event.type==="audio")).toBe(false);expect(events.at(-1).type).toBe("done");
+ }finally{release(null);spy.mockRestore();}
+});
